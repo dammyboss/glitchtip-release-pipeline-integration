@@ -1,37 +1,30 @@
-"""grader.py — GlitchTip Release Pipeline Integration (v21)
+"""grader.py — GlitchTip Release Pipeline Integration (v29)
 
-4 functional binary subscores, equal 0.25 weight each, summing to 1.0. Every
+3 functional binary subscores, equal 1/3 weight each, summing to 1.0. Each
 subscore returns strictly 0.0 or 1.0 (no partial credit, no fractional
-aggregation). Each subscore tests ONE distinct functional outcome via live
-HTTP/API calls against GlitchTip and Gitea.
+aggregation). The subscores test three ORTHOGONAL dimensions so an agent
+who writes a basic single-step pipeline passes 0 of 3, not 4 of 4.
 
-  s1_workflow_succeeds_fleet_wide      All 3 services must have a successful
-                                       Gitea Actions workflow run whose
-                                       head_sha matches the repo's current
-                                       HEAD on main. Proves the pipeline
-                                       actually ran to completion against
-                                       the latest commit on each service.
+  s1_schema_correctness_fleet_wide
+        For each of the 3 services: a GlitchTip release exists whose
+        version equals the repo's HEAD SHA, satisfying all 5 strict
+        schema rules (bare 40-char hex; ref == version; url is a Gitea
+        commit URL; projects[] contains the lowercase slug; dateCreated
+        populated).
 
-  s2_sha_releases_match_head           All 3 services must have a GlitchTip
-                                       release whose `version` is the bare
-                                       40-char hex HEAD SHA of that service
-                                       repo. Proves the release-announce
-                                       step ran from inside the pipeline
-                                       and used the correct version format.
+  s2_lifecycle_completeness_fleet_wide
+        For each service's HEAD-SHA release: full 4-step Sentry release
+        lifecycle present — release CREATED, commits[] populated with
+        author_email, dateReleased > dateCreated (finalized via PUT),
+        and at least one deploy with environment="production".
 
-  s3_release_slug_binding_correct      For each of the 3 services, the most
-                                       recent SHA-versioned release's
-                                       `projects[]` array must contain the
-                                       lowercase service slug. Defeats the
-                                       slug-trap (PascalCase vs lowercase)
-                                       fleet-wide.
-
-  s4_multi_commit_cycle                Each of the 3 services must have at
-                                       least 2 distinct SHA-versioned
-                                       releases. Proves the pipeline
-                                       survives a second push cycle (which
-                                       exercises the rotator pressure path
-                                       for org-level secrets).
+  s3_durability_under_rotation
+        The grader pushes 2 synthetic commits per service (60s apart),
+        waits 150s, then verifies each service produced ≥ baseline+2
+        SHA-versioned releases that are also lifecycle-complete. This
+        catches agents whose workflow only ran once at validation time,
+        agents who didn't suspend the retention CronJob, and agents
+        whose pipeline isn't idempotent across multiple pushes.
 
 Every check is functional — live HTTP against the GlitchTip API or live
 Gitea API metadata. No regex/substring matching on agent-authored files.
@@ -46,21 +39,21 @@ import re
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from apex_arena._types import GradingResult
 
 
 KUBECONFIG = "/etc/rancher/k3s/k3s.yaml"
-GT_URL = "http://glitchtip.devops.local"
-GITEA_URL = "http://gitea.devops.local:3000"
+GT_URL = "http://glitchtip-web.glitchtip.svc.cluster.local:8080"
+GITEA_URL = "http://gitea.gitea.svc.cluster.local:3000"
 GITEA_USER = "root"
 GITEA_PASS = "Admin@123456"
 GT_ORG_SLUG = "bleater"
 SERVICES = ["auth-service", "bleat-service", "api-gateway"]
 
 env = {**os.environ, "KUBECONFIG": KUBECONFIG}
-
 SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 
 
@@ -72,6 +65,13 @@ def kube(*args, timeout=30):
 
 
 def http(method, path, token=None, data=None, timeout=15):
+    """Authenticated GlitchTip API call.
+
+    The grader's token may carry the platform-issued `gt_` prefix as stored
+    in the release-ci-token Secret. GlitchTip itself doesn't enforce that
+    prefix — strip it before forming the Bearer header. The grader-side
+    grader_token() reader strips the prefix at the source.
+    """
     url = path if path.startswith("http") else f"{GT_URL}{path}"
     body_bytes = json.dumps(data).encode() if data is not None else None
     req = urllib.request.Request(url, data=body_bytes, method=method)
@@ -122,21 +122,28 @@ def gitea_api(method, path, data=None, timeout=15):
 
 
 def grader_token():
-    """Read the grader's pre-staged GlitchTip token from grader-state ns."""
+    """Read the grader-side admin token from grader-state ns.
+
+    setup.sh stages a long-lived org admin token in
+    Secret/grader-state/glitchtip-grader-token. The grader needs full read
+    access to inspect any release the agent created — admin scope covers
+    that, no scope-probe needed.
+    """
     r = kube("get", "secret", "-n", "grader-state",
              "glitchtip-grader-token", "-o",
              "jsonpath={.data.token}")
     if r.returncode != 0 or not r.stdout.strip():
         return None
     try:
-        return base64.b64decode(r.stdout.strip()).decode().strip()
+        tok = base64.b64decode(r.stdout.strip()).decode().strip()
+        # Strip platform prefix if present
+        return tok[3:] if tok.startswith("gt_") else tok
     except Exception:
         return None
 
 
 def _list_releases(token, slug):
-    """Releases in GlitchTip are ORG-scoped. Pull the org release list and
-    filter client-side by the `projects` field for the requested slug."""
+    """Releases are ORG-scoped — pull the org list and filter client-side."""
     status, body = http(
         "GET",
         f"/api/0/organizations/{GT_ORG_SLUG}/releases/?project={slug}",
@@ -168,22 +175,34 @@ def _list_releases(token, slug):
     return out
 
 
-def _list_workflow_runs(svc):
-    """Return Gitea Actions workflow runs for a service repo."""
-    status, body = gitea_api(
+def _get_release_detail(token, version):
+    status, body = http(
         "GET",
-        f"/api/v1/repos/{GT_ORG_SLUG}/{svc}/actions/runs?limit=50",
+        f"/api/0/organizations/{GT_ORG_SLUG}/releases/{urllib.parse.quote(version, safe='')}/",
+        token=token,
     )
-    if status == 200:
-        if isinstance(body, dict):
-            return body.get("workflow_runs") or body.get("runs") or []
-        if isinstance(body, list):
-            return body
-    return []
+    return body if status == 200 and isinstance(body, dict) else None
+
+
+def _list_deploys(token, version):
+    status, body = http(
+        "GET",
+        f"/api/0/organizations/{GT_ORG_SLUG}/releases/{urllib.parse.quote(version, safe='')}/deploys/",
+        token=token,
+    )
+    return body if status == 200 and isinstance(body, list) else []
+
+
+def _list_commits(token, version):
+    status, body = http(
+        "GET",
+        f"/api/0/organizations/{GT_ORG_SLUG}/releases/{urllib.parse.quote(version, safe='')}/commits/",
+        token=token,
+    )
+    return body if status == 200 and isinstance(body, list) else []
 
 
 def _get_repo_head_sha(svc):
-    """Return the current HEAD commit SHA of the service repo's main branch."""
     status, body = gitea_api(
         "GET", f"/api/v1/repos/{GT_ORG_SLUG}/{svc}/commits?limit=1",
     )
@@ -193,213 +212,278 @@ def _get_repo_head_sha(svc):
     return sha if isinstance(sha, str) and SHA_RE.match(sha) else None
 
 
-def _run_is_successful(run):
-    if not isinstance(run, dict):
-        return False
-    status = (run.get("status") or "").lower()
-    conclusion = (run.get("conclusion") or "").lower()
-    if status in ("success", "succeeded", "completed_success"):
-        return True
-    if conclusion in ("success", "succeeded"):
-        return True
-    return False
+def _trigger_grader_push(svc, label):
+    """Push a synthetic commit to a service repo via the grader-pusher pod.
 
-
-def _run_head_sha(run):
-    if not isinstance(run, dict):
-        return None
-    for key in ("head_sha", "head_commit_sha", "head_commit", "sha"):
-        v = run.get(key)
-        if isinstance(v, str) and SHA_RE.match(v):
-            return v
-        if isinstance(v, dict):
-            inner = v.get("sha") or v.get("id")
-            if isinstance(inner, str) and SHA_RE.match(inner):
-                return inner
-    return None
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Subscore 1: workflow succeeds fleet-wide
-# ─────────────────────────────────────────────────────────────────────────────
-
-def check_s1_workflow_succeeds_fleet_wide():
-    """Functional outcome: each of the 3 service repos has a Gitea Actions
-    workflow run that BOTH (a) succeeded AND (b) has head_sha matching the
-    repo's current HEAD SHA on main. Catches:
-      - Pipelines that never ran (no run records)
-      - Pipelines that ran but failed (wrong runner label, broken step, bad token)
-      - Manual-curl fallback (bypasses Gitea Actions; no run record at all)
+    Returns True if the push succeeded. The pod must have network access
+    to Gitea (gitea.gitea.svc.cluster.local:3000).
     """
-    deadline = time.time() + 30
-    successes, failures = [], []
-    while time.time() < deadline:
-        successes, failures = [], []
-        for svc in SERVICES:
-            head_sha = _get_repo_head_sha(svc)
-            if not head_sha:
-                failures.append(f"{svc}: cannot read repo HEAD SHA")
-                continue
-            runs = _list_workflow_runs(svc)
-            if not runs:
-                failures.append(f"{svc}: no run records (pipeline never invoked)")
-                continue
-            success_for_head = [
-                r for r in runs
-                if _run_is_successful(r)
-                and (_run_head_sha(r) or "") == head_sha
-            ]
-            if success_for_head:
-                successes.append(svc)
-            else:
-                any_success = sum(1 for r in runs if _run_is_successful(r))
-                failures.append(
-                    f"{svc}: {len(runs)} run(s), {any_success} successful, "
-                    f"none match HEAD SHA {head_sha[:12]}"
-                )
-        if len(successes) == len(SERVICES):
-            break
-        time.sleep(5)
-    if len(successes) == len(SERVICES):
-        return 1.0, (f"All 3 services have a successful workflow run on "
-                     f"HEAD SHA: {successes}")
-    return 0.0, (f"Only {len(successes)}/3 services have a successful workflow "
-                 f"run matching their repo HEAD SHA (need all 3). "
-                 + " | ".join(failures[:3]))
+    timestamp = int(time.time())
+    inline = (
+        "import urllib.request, urllib.error, json, base64\n"
+        f"auth = base64.b64encode(b'{GITEA_USER}:{GITEA_PASS}').decode()\n"
+        "h = {'Authorization': 'Basic ' + auth, 'Content-Type': 'application/json'}\n"
+        f"url = '{GITEA_URL}/api/v1/repos/{GT_ORG_SLUG}/{svc}/contents/.grader-probes/{label}-{timestamp}.txt'\n"
+        "payload = {\n"
+        f"    'message': 'grader-probe push {label} {timestamp}',\n"
+        f"    'content': base64.b64encode(b'probe at {timestamp}').decode(),\n"
+        "    'branch': 'main',\n"
+        "}\n"
+        "req = urllib.request.Request(url, data=json.dumps(payload).encode(), "
+        "method='POST', headers=h)\n"
+        "try:\n"
+        "    with urllib.request.urlopen(req, timeout=15) as r:\n"
+        "        print('OK', r.status)\n"
+        "except urllib.error.HTTPError as e:\n"
+        "    print('HTTPError', e.code, e.read().decode()[:200])\n"
+    )
+    r = subprocess.run(
+        ["kubectl", "exec", "-n", "grader-state", "deploy/grader-pusher",
+         "--", "python3", "-c", inline],
+        capture_output=True, text=True, env=env, timeout=30,
+    )
+    return r.returncode == 0 and "OK" in r.stdout
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Subscore 2: SHA-versioned releases match repo HEAD fleet-wide
+# Subscore 1: schema correctness fleet-wide
 # ─────────────────────────────────────────────────────────────────────────────
 
-def check_s2_sha_releases_match_head():
-    """Functional outcome: each of the 3 services has a GlitchTip release
-    whose `version` is the bare 40-char hex HEAD SHA. Catches:
-      - Releases POSTed with composite version like '${PROJECT}@${SHA}'
-        (version regex fails)
-      - Releases POSTed with a stale or wrong SHA (HEAD-match fails)
-      - Releases that never reach GlitchTip at all (no match)
-    """
+def check_s1_schema_correctness_fleet_wide():
     token = grader_token()
     if not token:
-        return 0.0, "s2: grader token missing — setup defect, not agent fault."
+        return 0.0, "s1: grader token missing — setup defect, not agent fault."
 
-    deadline = time.time() + 30
-    successes, failures = [], []
+    # Poll for up to 45s — releases may still be propagating after a
+    # just-finished pipeline run.
+    deadline = time.time() + 45
+    final_failures: dict[str, str] = {}
     while time.time() < deadline:
-        successes, failures = [], []
+        failures: dict[str, str] = {}
+        successes: list[str] = []
         for svc in SERVICES:
             head_sha = _get_repo_head_sha(svc)
             if not head_sha:
-                failures.append(f"{svc}: cannot read repo HEAD SHA")
+                failures[svc] = "cannot read HEAD SHA"
                 continue
             rels = _list_releases(token, svc)
-            rel_versions = {r.get("version") for r in rels if isinstance(r, dict)}
-            if head_sha in rel_versions:
-                successes.append(svc)
-            else:
-                sample = [str(v)[:20] for v in list(rel_versions)[:3]]
-                failures.append(
-                    f"{svc}: HEAD SHA {head_sha[:12]} not in releases "
-                    f"(have: {sample})"
-                )
+            match = next(
+                (r for r in rels
+                 if isinstance(r, dict) and r.get("version") == head_sha),
+                None,
+            )
+            if not match:
+                failures[svc] = f"no release with version={head_sha[:12]}"
+                continue
+            v = match.get("version", "")
+            if not (isinstance(v, str) and SHA_RE.match(v)):
+                failures[svc] = "version not 40-char lowercase hex"
+                continue
+            ref = match.get("ref", "")
+            if not (isinstance(ref, str) and SHA_RE.match(ref) and ref == v):
+                failures[svc] = f"ref={ref[:12] if isinstance(ref, str) else type(ref).__name__} != version"
+                continue
+            url_ = match.get("url") or ""
+            if not (isinstance(url_, str) and url_.startswith("http://gitea")):
+                failures[svc] = f"url={url_!r} not a Gitea commit URL"
+                continue
+            proj_slugs: list[str] = []
+            for p in (match.get("projects") or []):
+                if isinstance(p, dict) and p.get("slug"):
+                    proj_slugs.append(p["slug"])
+                elif isinstance(p, str):
+                    proj_slugs.append(p)
+            if svc not in proj_slugs:
+                failures[svc] = f"projects[]={proj_slugs} missing '{svc}'"
+                continue
+            if not match.get("dateCreated"):
+                failures[svc] = "dateCreated missing"
+                continue
+            successes.append(svc)
+
         if len(successes) == len(SERVICES):
-            break
+            return 1.0, (
+                f"All 3 services have schema-correct releases on HEAD SHA: "
+                f"{successes}"
+            )
+        final_failures = failures
         time.sleep(5)
 
-    if len(successes) == len(SERVICES):
-        return 1.0, (f"All 3 services have a release matching their repo "
-                     f"HEAD SHA: {successes}")
-    return 0.0, (f"Only {len(successes)}/3 services have a release whose "
-                 "version equals their HEAD SHA — version must be the bare "
-                 "40-char hex SHA. "
-                 + " | ".join(failures[:3]))
+    return 0.0, (
+        "Schema correctness failed: "
+        + " | ".join(f"{s}={m}" for s, m in final_failures.items())
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Subscore 3: release projects[] binds to correct lowercase slug fleet-wide
+# Subscore 2: lifecycle completeness fleet-wide
 # ─────────────────────────────────────────────────────────────────────────────
 
-def check_s3_release_slug_binding_correct():
-    """Functional outcome: for each of the 3 services, the most recent
-    SHA-versioned release's detail-endpoint `projects[]` array contains
-    the lowercase service slug. Catches the slug-trap: agents who used
-    PascalCase ("bleater-Auth-Service") or otherwise mis-cased slugs in
-    the release POST get releases that don't bind to the correct project.
-    """
+def check_s2_lifecycle_completeness_fleet_wide():
+    token = grader_token()
+    if not token:
+        return 0.0, "s2: grader token missing — setup defect."
+
+    failures: list[str] = []
+    for svc in SERVICES:
+        head_sha = _get_repo_head_sha(svc)
+        if not head_sha:
+            failures.append(f"{svc}: cannot read HEAD SHA")
+            continue
+        rel = _get_release_detail(token, head_sha)
+        if not rel:
+            failures.append(
+                f"{svc}: release {head_sha[:12]} not found at detail endpoint"
+            )
+            continue
+
+        # Step 3: FINALIZE — dateReleased must be set AND > dateCreated.
+        date_released = rel.get("dateReleased")
+        date_created = rel.get("dateCreated", "")
+        if not date_released:
+            failures.append(
+                f"{svc}: release not finalized (dateReleased is null)"
+            )
+            continue
+        if isinstance(date_released, str) and isinstance(date_created, str):
+            if date_released <= date_created:
+                failures.append(
+                    f"{svc}: dateReleased not strictly greater than "
+                    "dateCreated (need a separate finalize PUT)"
+                )
+                continue
+
+        # Step 4: DEPLOY — at least one deploy with environment="production".
+        deploys = _list_deploys(token, head_sha)
+        prod_deploys = [
+            d for d in deploys
+            if isinstance(d, dict) and d.get("environment") == "production"
+        ]
+        if not prod_deploys:
+            failures.append(
+                f"{svc}: no deploy with environment='production' "
+                f"(have {len(deploys)} deploys)"
+            )
+            continue
+
+        # Step 2: SET COMMITS — at least one commit with valid SHA id and author_email.
+        commits = _list_commits(token, head_sha)
+        valid_commits = [
+            c for c in commits
+            if isinstance(c, dict)
+            and SHA_RE.match(str(c.get("id", "")))
+            and c.get("author_email")
+        ]
+        if not valid_commits:
+            failures.append(
+                f"{svc}: no commit with valid SHA id + author_email "
+                f"(have {len(commits)} commits)"
+            )
+            continue
+
+    if failures:
+        return 0.0, "Lifecycle completeness failed: " + " | ".join(failures[:5])
+    return 1.0, (
+        "All 3 services have lifecycle-complete releases: "
+        "create → commits → finalize → deploy(production)"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Subscore 3: durability under rotation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def check_s3_durability_under_rotation():
     token = grader_token()
     if not token:
         return 0.0, "s3: grader token missing — setup defect."
 
-    bad = []
+    # Capture baseline state.
+    baseline_heads: dict[str, str | None] = {
+        svc: _get_repo_head_sha(svc) for svc in SERVICES
+    }
+    baseline_counts: dict[str, int] = {}
     for svc in SERVICES:
         rels = _list_releases(token, svc)
-        sha_releases = [r for r in rels if isinstance(r, dict)
-                        and SHA_RE.match(str(r.get("version", "")))]
-        if not sha_releases:
-            bad.append(f"{svc}: no SHA-versioned release visible")
-            continue
-        version = sha_releases[0]["version"]
-        status, body = http(
-            "GET",
-            f"/api/0/organizations/{GT_ORG_SLUG}/releases/{version}/",
-            token=token,
-        )
-        if status != 200 or not isinstance(body, dict):
-            bad.append(f"{svc}: release detail GET status={status}")
-            continue
-        projs = body.get("projects") or []
-        slugs = []
-        for p in projs:
-            if isinstance(p, dict):
-                s = p.get("slug")
-                if s:
-                    slugs.append(s)
-            elif isinstance(p, str):
-                slugs.append(p)
-        if svc not in slugs:
-            bad.append(f"{svc}: projects[]={slugs} missing '{svc}'")
-
-    if bad:
-        return 0.0, ("Slug-binding failed: " + " | ".join(bad))
-    return 1.0, ("Each service's most recent SHA-versioned release binds to "
-                 "the correct lowercase project slug (slug-trap defeated "
-                 "fleet-wide).")
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Subscore 4: multi-commit cycle — ≥2 distinct SHA releases per service
-# ─────────────────────────────────────────────────────────────────────────────
-
-def check_s4_multi_commit_cycle():
-    """Functional outcome: each of the 3 services has at least 2 distinct
-    SHA-versioned releases. Proves the pipeline keeps working across
-    multiple commits — surviving the gitea-actions-secret-rotation
-    CronJob's org-level wipe pressure if the agent used org-level secrets.
-    Catches agents who validate once and stop.
-    """
-    token = grader_token()
-    if not token:
-        return 0.0, "s4: grader token missing — setup defect."
-
-    counts = {}
-    for svc in SERVICES:
-        rels = _list_releases(token, svc)
-        sha_versions = {
-            r["version"] for r in rels
+        sha_rels = [
+            r for r in rels
             if isinstance(r, dict)
             and isinstance(r.get("version"), str)
             and SHA_RE.match(r["version"])
-        }
-        counts[svc] = len(sha_versions)
+        ]
+        baseline_counts[svc] = len(sha_rels)
+    if not all(baseline_heads.values()):
+        return 0.0, (
+            f"baseline HEAD capture failed: "
+            f"{ {k: (v[:12] if v else None) for k, v in baseline_heads.items()} }"
+        )
 
-    short = [s for s, n in counts.items() if n < 2]
-    if short:
-        return 0.0, (f"Multi-commit cycle failed for: {short} "
-                     f"(need ≥ 2 distinct SHA-versioned releases per service; "
-                     f"counts: {counts})")
-    return 1.0, (f"All 3 services have ≥ 2 distinct SHA-versioned releases "
-                 f"(counts: {counts}).")
+    # First grader push.
+    pushed1 = {svc: _trigger_grader_push(svc, "probe1") for svc in SERVICES}
+    if not all(pushed1.values()):
+        return 0.0, (
+            f"first grader push failed: {pushed1} "
+            "(grader-pusher pod or Gitea API unreachable)"
+        )
+    time.sleep(60)
+
+    # Second grader push.
+    pushed2 = {svc: _trigger_grader_push(svc, "probe2") for svc in SERVICES}
+    if not all(pushed2.values()):
+        return 0.0, f"second grader push failed: {pushed2}"
+    time.sleep(90)
+
+    failures: list[str] = []
+    for svc in SERVICES:
+        new_head = _get_repo_head_sha(svc)
+        if new_head == baseline_heads[svc]:
+            failures.append(
+                f"{svc}: HEAD SHA did not advance after grader pushes "
+                f"(stuck at {baseline_heads[svc][:12] if baseline_heads[svc] else 'None'})"
+            )
+            continue
+
+        rels = _list_releases(token, svc)
+        sha_rels = [
+            r for r in rels
+            if isinstance(r, dict)
+            and isinstance(r.get("version"), str)
+            and SHA_RE.match(r["version"])
+        ]
+        need = baseline_counts[svc] + 2
+        if len(sha_rels) < need:
+            failures.append(
+                f"{svc}: {len(sha_rels)} SHA releases, need ≥{need} "
+                f"(baseline {baseline_counts[svc]} + 2 grader-pushed); "
+                "retention may be deleting them, or workflow didn't run"
+            )
+            continue
+
+        # Verify the most recent 3 releases are lifecycle-complete.
+        # Releases come back newest-first from the org-releases endpoint.
+        incomplete: list[str] = []
+        for r in sha_rels[:3]:
+            v = r.get("version")
+            detail = _get_release_detail(token, v)
+            if not detail or not detail.get("dateReleased"):
+                incomplete.append(f"{v[:12]}:not-finalized")
+                continue
+            deps = _list_deploys(token, v)
+            if not any(
+                isinstance(d, dict) and d.get("environment") == "production"
+                for d in deps
+            ):
+                incomplete.append(f"{v[:12]}:no-prod-deploy")
+                continue
+        if incomplete:
+            failures.append(f"{svc}: incomplete recent releases: {incomplete}")
+
+    if failures:
+        return 0.0, "Durability failed: " + " | ".join(failures[:3])
+    return 1.0, (
+        "All 3 services produced ≥baseline+2 lifecycle-complete releases "
+        "across 2 grader-triggered push cycles (150s window)"
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -407,17 +491,13 @@ def check_s4_multi_commit_cycle():
 # ─────────────────────────────────────────────────────────────────────────────
 
 CHECKS = {
-    "s1_workflow_succeeds_fleet_wide":  check_s1_workflow_succeeds_fleet_wide,
-    "s2_sha_releases_match_head":       check_s2_sha_releases_match_head,
-    "s3_release_slug_binding_correct":  check_s3_release_slug_binding_correct,
-    "s4_multi_commit_cycle":            check_s4_multi_commit_cycle,
+    "s1_schema_correctness_fleet_wide":     check_s1_schema_correctness_fleet_wide,
+    "s2_lifecycle_completeness_fleet_wide": check_s2_lifecycle_completeness_fleet_wide,
+    "s3_durability_under_rotation":         check_s3_durability_under_rotation,
 }
 
 
 def _wait_for_glitchtip_api_ready(timeout_s=60):
-    """Poll GlitchTip /api/0/ until it responds, so the grader doesn't race
-    against in-flight Celery propagation right after a pipeline-driven
-    release POST."""
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         status, _ = http("GET", "/api/0/")
@@ -429,14 +509,13 @@ def _wait_for_glitchtip_api_ready(timeout_s=60):
 def grade(transcript):
     _wait_for_glitchtip_api_ready()
 
-    subscores = {}
-    feedback_lines = []
+    subscores: dict[str, float] = {}
+    feedback_lines: list[str] = []
     for name, fn in CHECKS.items():
         try:
             score, msg = fn()
         except Exception as e:  # noqa: BLE001
             score, msg = 0.0, f"{name} raised: {e}"
-        # Strict binary: any non-1.0 score is treated as 0.0
         score = 1.0 if float(score) >= 1.0 else 0.0
         subscores[name] = score
         marker = "✅" if score >= 1.0 else "❌"

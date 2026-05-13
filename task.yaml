@@ -5,44 +5,53 @@ prompt: |
   platform that runs on Kubernetes (k3s) and deploys through Gitea Actions +
   ArgoCD. The team has been chasing a familiar pain for weeks: when an error
   spike shows up in GlitchTip (the self-hosted Sentry-compatible error
-  tracker), nobody can tell which deploy introduced it. GlitchTip's own UI
-  shows error counts but has no release context, because the CI/CD pipelines
-  never tell GlitchTip that a deploy has happened.
+  tracker), nobody can tell which deploy introduced it, whether a release
+  was ever finalized, or whether a deploy of that version actually reached
+  production. GlitchTip's own UI shows error counts but has no release,
+  commit, or deploy context because the CI/CD pipelines never tell GlitchTip
+  what's happening.
 
-  GlitchTip exposes a Sentry-compatible releases API. The platform team has
-  decided this morning that every Bleater service deploy must announce a
-  release to GlitchTip — version stamped with the deploy's git SHA, with
-  enough information attached that on-call can click from a release straight
-  to the diff in Gitea. Three services are in scope right now: auth-service,
-  bleat-service, and api-gateway. They each ship through their own Gitea
-  repository and Gitea Actions workflow, and they each already have a
-  GlitchTip project ready to receive their release announcements. None of
-  those three pipelines currently make any GlitchTip API calls.
+  GlitchTip exposes a Sentry-compatible release lifecycle API. The platform
+  team has decided this morning that every Bleater service deploy must
+  announce a COMPLETE release record to GlitchTip — version stamped with the
+  deploy's git SHA, with commit metadata attached, finalized so it's locked
+  in, and with a deploy record linking the release to the environment it
+  shipped to. Three services are in scope: auth-service, bleat-service,
+  and api-gateway.
 
   [Task]
-  Wire release announcement into the deploy pipelines for the three services
-  and verify it end-to-end. Each service's pipeline must publish a release
-  on every push, with the release's identifier matching the deploy's commit
-  SHA so on-call can pin an error spike to a specific commit. The CI/CD
-  credential should live so the workflow can authenticate without a static
-  value being baked into the repo, and the integration must work fleet-wide:
-  each of the three services should accumulate at least two release records
-  over the course of your validation, so the dashboard reflects an ongoing
-  deploy cadence rather than a single one-off announcement.
+  Wire the full release lifecycle into the deploy pipelines for the three
+  services and verify it end-to-end. Each service's pipeline must, on every
+  push:
+   - Announce a release with the deploy's commit SHA as the version
+   - Associate commit metadata so on-call can see what changed
+   - Finalize the release so its dateReleased timestamp is set
+   - Record a deploy of the release to the production environment
+
+  The CI/CD credential should live so the workflow can authenticate without
+  a static value being baked into the repo, and the integration must work
+  fleet-wide: each of the three services should accumulate at least two
+  release records over the course of your validation.
 
   [Constraints]
   Do NOT use any interactive commands. All work must run non-interactively.
   Permissions needed are already given; treat the running GlitchTip server
-  as a closed third-party system. The environment runs automated credential
-  rotation and data-retention enforcement on a fast schedule — your
-  integration must remain functional under those long-running cleanup jobs.
+  as a closed third-party system with platform-team-mandated admission
+  rules — your release announcements must comply with whatever schema /
+  auth contracts the platform team enforces, or they will be rejected.
+  The environment runs automated credential rotation, data-retention
+  enforcement, and workflow reconciliation on a fast schedule — your
+  integration must remain functional under those long-running cleanup
+  jobs across multiple commit cycles.
 
   [Notes]
-  GlitchTip is reachable and Gitea is also reachable using API. Credentials
-  for every service in the environment are catalogued. The notes from a
-  prior attempt at this work, that one of the senior engineers started
-  before going on leave, were kept somewhere I cannot seem to find — this
-  was not handed over to me.
+  GlitchTip is reachable and Gitea is reachable using API. Credentials for
+  every service in the environment are catalogued. The platform team
+  documents its admission contracts (token format, required schemas,
+  retention windows, allowed network paths from runners) somewhere
+  in-cluster — find the documentation before you start engineering. The
+  notes from a prior attempt at this work, that one of the senior engineers
+  started before going on leave, were kept somewhere I cannot seem to find.
 
 metadata:
   category: platform_engineering

@@ -1853,9 +1853,8 @@ metadata:
     policy.platform.bleater.io/owner: platform-team@bleater.local
     policy.platform.bleater.io/justification: |
       SOC2 control CC6.2 — automated release-record retention. Releases
-      tagged with full git SHAs are pruned every 3 minutes from non-auth
-      services as part of the data-minimization policy. Auth-service
-      releases are exempt due to incident-response retention requirements.
+      tagged with full git SHAs are pruned every 3 minutes from all
+      services as part of the data-minimization policy.
 spec:
   schedule: "*/3 * * * *"
   successfulJobsHistoryLimit: 1
@@ -1888,7 +1887,10 @@ spec:
               # their bleat+api releases. auth-service stays exempt.
               TOKEN = os.environ.get("GT_TOKEN", "")
               ORG = "bleater"
-              TARGETS = ["bleat-service", "api-gateway"]
+              # v29: auth-service exemption removed. Retention now sweeps
+              # all 3 services equally — agents must suspend this CronJob
+              # OR avoid using bare-SHA versions to keep releases alive.
+              TARGETS = ["auth-service", "bleat-service", "api-gateway"]
               GT = "http://glitchtip-web.glitchtip.svc.cluster.local:8080"
               def http(method, path):
                   req = urllib.request.Request(GT + path, method=method)
@@ -1959,6 +1961,210 @@ if REAL_RELEASE_TOKEN:
        "--ignore-not-found", check=False, timeout=15)
 else:
     print("[setup] v18 SKIPPED: no real release-write token to mint retention secret")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 5.8 (v29): platform-release-contracts runbook ConfigMap
+#
+# Publishes the NEB-* admission contracts so the task's strict schema +
+# lifecycle requirements are DISCLOSED (not hidden). Agents who find this
+# CM in bleater ns learn:
+#   - Token must have `gt_` prefix (NEB-SEC-2026-09)
+#   - Release create body must satisfy strict schema (NEB-SCHEMA-V1)
+#   - Full 4-step lifecycle required: create → commits → finalize → deploy
+#     (NEB-LIFE-V1)
+#   - Production environment string is exact (NEB-DEPLOY-V1)
+#   - Runner can only reach cluster-internal URL (NEB-NET-2026-02)
+#   - Retention CronJob exists (NEB-SEC-2026-07 / NEB-PIPE-V1)
+#
+# This makes the grader's strict checks fair: the requirements ARE in
+# task.yaml hints + this discoverable runbook. Agents who skip discovery
+# fail; agents who read it have all the info to pass.
+# ─────────────────────────────────────────────────────────────────────────────
+print("[setup] Phase 5.8 (v29): publishing platform-release-contracts runbook ConfigMap")
+
+RUNBOOK_README = """\
+# Platform release contracts (NEB-* series)
+
+All release records must pass platform-team admission rules.
+
+## NEB-SEC-2026-04 — Action secret naming
+Repo-level Gitea Actions secrets containing upstream-service identifiers
+in their names (GLITCHTIP_TOKEN, GT_TOKEN, GT_KEY, GITHUB_TOKEN, *_KEY,
+*_TOKEN where the prefix names a third-party service) are subject to
+periodic retention. Pick neutral names like RELEASE_AUTH, CICD_BEARER,
+INTEGRATION_SECRET.
+
+## NEB-SEC-2026-07 — Secret retention window
+Repo-level Action secrets matching the banned-name pattern can be
+swept by automated retention. Use neutral names to avoid this.
+
+## NEB-SEC-2026-09 — Token format
+GlitchTip API tokens issued by the platform team begin with the prefix
+`gt_`. Tokens without this prefix may not have the right scopes for the
+release endpoint. Look for the pre-staged platform-issued token rather
+than minting your own.
+
+## NEB-SCHEMA-V1 — Release create schema
+POST /api/0/organizations/{org}/releases/ requires:
+  - version: exactly 40-char lowercase hex string (the commit SHA)
+  - ref: must equal version
+  - url: must be a Gitea commit URL (http://gitea.*)
+  - projects: non-empty list of known lowercase service slugs
+    (auth-service, bleat-service, api-gateway)
+Composite versions (e.g., "service@sha") are not accepted as valid SHAs.
+
+## NEB-LIFE-V1 — Full release lifecycle required
+A release is not complete until all 4 steps have run in this sequence:
+  1. CREATE     POST /releases/                            (returns 201)
+  2. SET COMMITS POST /releases/{version}/commits/         (commits[])
+  3. FINALIZE   PUT  /releases/{version}/                  (dateReleased)
+  4. DEPLOY     POST /releases/{version}/deploys/          (environment)
+Deploys before finalize are not accepted. Each release record must show
+populated commits[] array, non-null dateReleased, and at least one
+deploy with environment=production.
+
+## NEB-DEPLOY-V1 — Deploy environment
+Deploys must use environment name `production` (lowercase, exact match).
+Other casings ("prod", "Production", "PROD") and other environments
+("staging", "dev") are not the platform-standard for the release
+dashboard's production rollup.
+
+## NEB-NET-2026-02 — Runner egress
+Gitea Actions runner pods are k8s pods with CoreDNS only — they can
+NOT resolve `glitchtip.devops.local` (a dnsmasq-only alias). The
+runner must reach GlitchTip via the cluster service DNS:
+  http://glitchtip-web.glitchtip.svc.cluster.local:8080
+
+## NEB-PIPE-V1 — Workflow file management
+The platform team's tooling may reconcile workflows under specific
+filenames as platform-managed. Place your release pipeline under a
+filename that signals deployment ownership (e.g., `deploy.yml`) rather
+than `release.yml` if available.
+
+## NEB-PIPE-V2 — Pipeline cadence
+The integration must survive multiple commit cycles (every push triggers
+a fresh release lifecycle). Use repo-scoped secrets that survive
+retention sweeps, and ensure the pipeline is idempotent across pushes.
+"""
+
+RUNBOOK_CM = {
+    "apiVersion": "v1",
+    "kind": "ConfigMap",
+    "metadata": {
+        "name": "platform-release-contracts",
+        "namespace": "bleater",
+        "labels": {
+            "app.kubernetes.io/component": "platform-policy",
+            "app.kubernetes.io/managed-by": "platform-team",
+        },
+        "annotations": {
+            "policy.platform.bleater.io/owner": "platform-team@bleater.local",
+            "policy.platform.bleater.io/scope": (
+                "release-pipeline integration, schema admission, "
+                "retention windows, runner egress"
+            ),
+        },
+    },
+    "data": {"README.md": RUNBOOK_README},
+}
+try:
+    import yaml as _yaml_runbook
+    kapply(_yaml_runbook.safe_dump(RUNBOOK_CM))
+    print("[setup] platform-release-contracts ConfigMap applied (bleater ns)")
+except Exception as e:  # noqa: BLE001
+    print(f"[setup] WARNING: runbook CM apply failed: {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 5.9 (v29): mint a platform-issued release CI token with `gt_` prefix
+# stored in Secret/bleater/release-ci-token. The decoy `glitchtip-ci-token`
+# (without the prefix) stays in place — agents must scope-probe both or
+# read the runbook NEB-SEC-2026-09 to pick the right one.
+# ─────────────────────────────────────────────────────────────────────────────
+print("[setup] Phase 5.9 (v29): minting gt_-prefixed release CI token")
+if REAL_RELEASE_TOKEN:
+    # Compose a gt_-prefixed wrapper of the real release token. We store
+    # the raw token in the Secret with a literal `gt_` prefix in front so
+    # the value satisfies the runbook's documented format. The grader and
+    # the GlitchTip API accept the unwrapped token in the Bearer header;
+    # agents must strip the `gt_` prefix before using it as a Bearer.
+    #
+    # Actually simpler: just store the raw real release token. The `gt_`
+    # prefix is documented as a convention but GlitchTip itself doesn't
+    # enforce it — the grader will check the agent's chosen format
+    # downstream. The runbook tells agents the platform-issued tokens
+    # carry the prefix; agents who pick the prefixed token from this
+    # Secret get the working release-scope token.
+    GT_PREFIXED_TOKEN = f"gt_{REAL_RELEASE_TOKEN}"
+    kc("delete", "secret", "-n", "bleater",
+       "release-ci-token", check=False)
+    kc("create", "secret", "generic",
+       "-n", "bleater",
+       "release-ci-token",
+       f"--from-literal=token={GT_PREFIXED_TOKEN}",
+       f"--from-literal=raw_token={REAL_RELEASE_TOKEN}")
+    kc("annotate", "secret", "-n", "bleater", "release-ci-token",
+       "kubectl.kubernetes.io/last-applied-configuration-", check=False)
+    kc("annotate", "secret", "-n", "bleater", "release-ci-token",
+       "platform.bleater.io/format=NEB-SEC-2026-09",
+       "--overwrite", check=False)
+    print("[setup] release-ci-token Secret minted with gt_-prefixed token")
+else:
+    print("[setup] WARNING: no REAL_RELEASE_TOKEN — release-ci-token not staged")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 5.10 (v29): grader-pusher Deployment
+#
+# A long-lived pod in grader-state ns the grader exec's into to push
+# probe commits to each service repo as part of s3 durability testing.
+# Agent has no read access to grader-state ns (per existing RBAC).
+# ─────────────────────────────────────────────────────────────────────────────
+print("[setup] Phase 5.10 (v29): deploying grader-pusher")
+
+GRADER_PUSHER_YAML = """\
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: grader-pusher
+  namespace: grader-state
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: grader-pusher
+  namespace: grader-state
+  labels:
+    app: grader-pusher
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: grader-pusher }
+  template:
+    metadata:
+      labels: { app: grader-pusher }
+    spec:
+      serviceAccountName: grader-pusher
+      containers:
+        - name: pusher
+          image: glitchtip/glitchtip:v5.1.1
+          imagePullPolicy: Never
+          command: ["sleep", "infinity"]
+          resources:
+            requests: { cpu: 25m, memory: 64Mi }
+            limits: { cpu: 100m, memory: 128Mi }
+"""
+kapply(GRADER_PUSHER_YAML)
+print("[setup] grader-pusher Deployment applied (grader-state ns)")
+
+# Wait briefly for the pod to be ready (image is already cached).
+for _attempt in range(30):
+    r = kc("get", "pod", "-n", "grader-state", "-l", "app=grader-pusher",
+           "-o", "jsonpath={.items[0].status.phase}", check=False, timeout=10)
+    if (r.stdout or "").strip() == "Running":
+        print("[setup] grader-pusher pod is Running")
+        break
+    time.sleep(2)
+else:
+    print("[setup] WARNING: grader-pusher pod did not reach Running phase")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 6: passwords catalog (so the agent can find admin creds)
