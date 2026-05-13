@@ -1,0 +1,50 @@
+id: glitchtip-release-pipeline-integration
+prompt: |
+  [Context]
+  You are the on-call Platform Engineer for Bleater, a microservices social
+  platform that runs on Kubernetes (k3s) and deploys through Gitea Actions +
+  ArgoCD. The team has been chasing a familiar pain for weeks: when an error
+  spike shows up in GlitchTip (the self-hosted Sentry-compatible error
+  tracker), nobody can tell which deploy introduced it. GlitchTip's own UI
+  shows error counts but has no release context, because the CI/CD pipelines
+  never tell GlitchTip that a deploy has happened.
+
+  GlitchTip exposes a Sentry-compatible releases API. The platform team has
+  decided this morning that every Bleater service deploy must announce a
+  release to GlitchTip — version stamped with the deploy's git SHA, with
+  enough information attached that on-call can click from a release straight
+  to the diff in Gitea. Three services are in scope right now: auth-service,
+  bleat-service, and api-gateway. They each ship through their own Gitea
+  repository and Gitea Actions workflow, and they each already have a
+  GlitchTip project ready to receive their release announcements. None of
+  those three pipelines currently make any GlitchTip API calls.
+
+  [Task]
+  Wire release announcement into the deploy pipelines for the three services
+  and verify it end-to-end. Each service's pipeline must publish a release
+  on every push, and the release record needs enough information that on-call
+  can click through to the actual commit diff. The CI/CD credential should
+  live so the workflow can authenticate without a static value being baked
+  into the repo, and the integration must work fleet-wide: each of the three
+  services should accumulate at least three release records over the course
+  of your validation, so the dashboard can show deploy history rather than
+  a single one-off announcement.
+
+  [Constraints]
+  Do NOT use any interactive commands. All work must run non-interactively. Permissions needed are already given;
+  treat the running GlitchTip server as a closed third-party system. The
+  environment runs automated credential rotation and data-retention
+  enforcement on a fast schedule — your integration must remain functional
+  under those long-running cleanup jobs (find them, work around them, or
+  disable them as appropriate).
+
+  [Notes]
+  GlitchTip is reachable and Gitea is also reachable using API. Credentials
+  for every service in the environment are catalogued. The notes from a
+  prior attempt at this work, that one of the senior engineers started
+  before going on leave, were kept somewhere I cannot seem to find — this
+  was not handed over to me.
+
+metadata:
+  category: platform_engineering
+  difficulty: hard
