@@ -554,7 +554,35 @@ print("[setup] Phase 1c: recreating glitchtip namespace from scratch")
 kc("delete", "namespace", "glitchtip",
    "--ignore-not-found", "--wait=true", "--timeout=120s",
    check=False, timeout=150)
+# v21: poll until namespace is fully gone (handles stuck finalizers) before
+# re-creating, otherwise RBAC applies below race against a Terminating ns.
+print("[setup] Phase 1c: polling for glitchtip ns deletion to complete...")
+for _attempt in range(60):
+    r = kc("get", "namespace", "glitchtip", check=False, timeout=10)
+    if r.returncode != 0:
+        break  # NotFound — namespace is gone
+    phase_r = kc("get", "namespace", "glitchtip",
+                 "-o", "jsonpath={.status.phase}", check=False, timeout=10)
+    if (phase_r.stdout or "").strip() == "Terminating":
+        # Strip finalizers to unstick if it's been > 30s
+        if _attempt >= 6:
+            print(f"[setup] glitchtip ns stuck in Terminating "
+                  f"(attempt {_attempt}); stripping finalizers...")
+            kc("patch", "namespace", "glitchtip",
+               "-p", '{"metadata":{"finalizers":[]}}',
+               "--type=merge", check=False, timeout=15)
+    time.sleep(5)
+# Now re-create cleanly and verify it's Active
 kc("create", "namespace", "glitchtip", check=False, timeout=15)
+for _attempt in range(20):
+    phase_r = kc("get", "namespace", "glitchtip",
+                 "-o", "jsonpath={.status.phase}", check=False, timeout=10)
+    if (phase_r.stdout or "").strip() == "Active":
+        print("[setup] glitchtip ns is Active")
+        break
+    time.sleep(2)
+else:
+    print("[setup] WARNING: glitchtip ns never became Active after recreate")
 kc("label", "namespace", "glitchtip",
    "istio-injection=disabled", "--overwrite", check=False, timeout=10)
 kc("label", "namespace", "glitchtip",
