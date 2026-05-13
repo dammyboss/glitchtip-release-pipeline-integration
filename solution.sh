@@ -263,7 +263,10 @@ jobs:
           set -e
           SHA="\${GITHUB_SHA}"
           BODY="{\"version\":\"\${SHA}\",\"ref\":\"\${SHA}\",\"projects\":[\"${svc}\"]}"
-          wget -q -O- --header="Authorization: Bearer \${GLITCHTIP_TOKEN}" --header="Content-Type: application/json" --post-data="\${BODY}" http://glitchtip.devops.local/api/0/organizations/bleater/releases/
+          # Use cluster service DNS — the act_runner job environment only has
+          # k8s coredns (10.43.0.10); glitchtip.devops.local is a dnsmasq
+          # alias unreachable from inside the cluster pod network.
+          wget -q -O- --header="Authorization: Bearer \${GLITCHTIP_TOKEN}" --header="Content-Type: application/json" --post-data="\${BODY}" http://glitchtip-web.glitchtip.svc.cluster.local:8080/api/0/organizations/bleater/releases/
 YAML
 )
     BUILD_B64=$(printf '%s' "$BUILD_YAML" | base64 -w0)
