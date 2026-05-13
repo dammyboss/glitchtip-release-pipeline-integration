@@ -83,10 +83,13 @@ GITEA_AUTH="$GITEA_USER:$GITEA_PASS"
 # advertised bleater token will produce zero release records.
 # ─────────────────────────────────────────────────────────────────────────────
 log "Step 1.7: probe staged bleater token for release-write scope"
+# Use a per-run unique probe version so a re-run against the same GlitchTip
+# state doesn't 500 on duplicate-version uniqueness collision.
+PROBE_SUFFIX=$(date +%s)_$$
 PROBE_HTTP=$(curl -s -o /tmp/_probe -w '%{http_code}' \
     -H "Authorization: Bearer $CI_TOKEN_PRE" \
     -X POST -H "Content-Type: application/json" \
-    -d '{"version":"_solution_scope_probe_","projects":["api-gateway"]}' \
+    -d "{\"version\":\"_solution_scope_probe_${PROBE_SUFFIX}\",\"projects\":[\"api-gateway\"]}" \
     "$GT/api/0/organizations/$ORG/releases/" 2>/dev/null || echo "000")
 log "  bleater-token release-POST probe: HTTP $PROBE_HTTP"
 
@@ -114,7 +117,7 @@ else
     PROBE2_HTTP=$(curl -s -o /tmp/_probe2 -w '%{http_code}' \
         -H "Authorization: Bearer $REAL_TOKEN" \
         -X POST -H "Content-Type: application/json" \
-        -d '{"version":"_solution_scope_probe2_","projects":["api-gateway"]}' \
+        -d "{\"version\":\"_solution_scope_probe2_${PROBE_SUFFIX}\",\"projects\":[\"api-gateway\"]}" \
         "$GT/api/0/organizations/$ORG/releases/" 2>/dev/null || echo "000")
     log "  default-ns prometheus-remote-write-token release-POST probe: HTTP $PROBE2_HTTP"
     if [ "$PROBE2_HTTP" != "200" ] && [ "$PROBE2_HTTP" != "201" ] && [ "$PROBE2_HTTP" != "208" ]; then
