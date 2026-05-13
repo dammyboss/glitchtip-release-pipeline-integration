@@ -259,13 +259,7 @@ jobs:
         run: |
           set -e
           SHA="\${GITHUB_SHA}"
-          # v19: simplified body. Removed `environment`, `dateReleased`,
-          # `commits` since those atoms were dropped as undisclosed.
-          # Kept `url` (commit-diff link) since s1.release_has_url_field_set
-          # is defensible from task.yaml's "click from a release straight
-          # to the diff in Gitea" language.
-          URL="http://gitea.devops.local/bleater/${svc}/commit/\${SHA}"
-          BODY="{\"version\":\"\${SHA}\",\"ref\":\"\${SHA}\",\"projects\":[\"${svc}\"],\"url\":\"\${URL}\"}"
+          BODY="{\"version\":\"\${SHA}\",\"ref\":\"\${SHA}\",\"projects\":[\"${svc}\"]}"
           wget -q -O- --header="Authorization: Bearer \${GLITCHTIP_TOKEN}" --header="Content-Type: application/json" --post-data="\${BODY}" http://glitchtip.devops.local/api/0/organizations/bleater/releases/
 YAML
 )
