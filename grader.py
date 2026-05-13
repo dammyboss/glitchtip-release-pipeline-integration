@@ -439,7 +439,7 @@ def grade(transcript):
         # Strict binary: any non-1.0 score is treated as 0.0
         score = 1.0 if float(score) >= 1.0 else 0.0
         subscores[name] = score
-        marker = "✓" if score >= 1.0 else "✗"  # ✓ / ✗
+        marker = "✅" if score >= 1.0 else "❌"
         feedback_lines.append(f"{marker} {name}: {msg}")
 
     n = len(subscores)
