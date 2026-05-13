@@ -329,15 +329,26 @@ poll_for_success_run () {
         local raw
         raw=$(curl -s -u "$GITEA_AUTH" \
             "$GITEA/api/v1/repos/$ORG/$svc/actions/runs?limit=10" 2>/dev/null || echo "{}")
+        # Pass the JSON via env var instead of piping it: piping plus a
+        # heredoc on python3's stdin causes bash to concatenate both into
+        # python's input, which makes python parse the JSON as part of the
+        # script body and crash silently. Reading from RAW_JSON env var
+        # avoids the stdin contention.
         local hit
-        hit=$(printf '%s' "$raw" | TARGET_SHA="$target_sha" python3 - <<'PY' 2>/dev/null || echo ""
+        hit=$(RAW_JSON="$raw" TARGET_SHA="$target_sha" python3 - <<'PY' 2>/dev/null || echo ""
 import json, os, sys
 target = (os.environ.get("TARGET_SHA") or "").lower()
+raw = os.environ.get("RAW_JSON") or "{}"
 try:
-    d = json.load(sys.stdin)
+    d = json.loads(raw)
 except Exception:
     sys.exit(0)
-runs = d.get("workflow_runs") or d.get("runs") or (d if isinstance(d, list) else [])
+if isinstance(d, dict):
+    runs = d.get("workflow_runs") or d.get("runs") or []
+elif isinstance(d, list):
+    runs = d
+else:
+    runs = []
 def head_sha(r):
     for k in ("head_sha", "head_commit_sha", "head_commit", "sha"):
         v = r.get(k)
