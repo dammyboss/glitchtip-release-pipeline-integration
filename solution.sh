@@ -145,11 +145,7 @@ jobs:
           # the grader's ref==version schema check.
           BODY="{\"version\":\"\$SHA\",\"ref\":\"\$SHA\",\"projects\":[\"\$PROJECT\"],\"dateReleased\":\"\$DR\"}"
           echo "Announcing release \$SHA for \$PROJECT (dateReleased=\$DR)"
-          wget -q -O- \\
-            --header="Authorization: Bearer \$TOKEN" \\
-            --header="Content-Type: application/json" \\
-            --post-data="\$BODY" \\
-            "${GT}/api/0/organizations/${ORG}/releases/"
+          wget -q -O- --header="Authorization: Bearer \$TOKEN" --header="Content-Type: application/json" --post-data="\$BODY" "${GT}/api/0/organizations/${ORG}/releases/"
           echo "Release \$SHA announced."
 YAML
 )
