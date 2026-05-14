@@ -11,24 +11,24 @@ prompt: |
   commit, or deploy context because the CI/CD pipelines never tell GlitchTip
   what's happening.
 
-  GlitchTip exposes a Sentry-compatible release API. The platform team has
-  decided this morning that every Bleater service deploy must announce a
-  release record to GlitchTip — version stamped with the deploy's git SHA,
-  with the commit reference preserved on the record, and finalized so its
-  dateReleased timestamp reflects when the deploy actually shipped (not
-  when the placeholder record was first created). Three services are in
-  scope: auth-service, bleat-service, and api-gateway.
+  GlitchTip exposes a Sentry-compatible release lifecycle API. The platform
+  team has decided this morning that every Bleater service deploy must
+  announce a COMPLETE release record to GlitchTip — version stamped with the
+  deploy's git SHA, with commit metadata attached, finalized so it's locked
+  in, and with a deploy record linking the release to the environment it
+  shipped to. Three services are in scope: auth-service, bleat-service,
+  and api-gateway.
 
   [Task]
-  Wire the release lifecycle into the deploy pipelines for the three
+  Wire the full release lifecycle into the deploy pipelines for the three
   services and verify it end-to-end. Each service's pipeline must, on every
   push:
-   - Announce a release with the deploy's commit SHA as the version, and
-     with the same SHA recorded as the release's commit ref
-   - Finalize the release after creation so its dateReleased timestamp is
-     set to a real ship time, distinct from the initial create timestamp,
-     and the commit ref stays bound to the release record after the
-     finalize step completes
+   - Announce a release whose version is the deploy's commit SHA, with the
+     same SHA recorded as the release's commit ref
+   - Attach commit metadata to the release so on-call can see what changed
+   - Finalize the release so its dateReleased timestamp reflects a real
+     ship time, distinct from the placeholder creation timestamp
+   - Record a deploy of the release to the production environment
 
   The CI/CD credential should live so the workflow can authenticate without
   a static value being baked into the repo, and the integration must work
@@ -39,21 +39,22 @@ prompt: |
   Do NOT use any interactive commands. All work must run non-interactively.
   Permissions needed are already given; treat the running GlitchTip server
   as a closed third-party system with platform-team-mandated admission
-  rules — your release announcements must comply with whatever schema /
-  auth contracts the platform team enforces, or they will be rejected.
-  The environment runs automated credential rotation, data-retention
-  enforcement, and workflow reconciliation on a fast schedule — your
-  integration must remain functional under those long-running cleanup
-  jobs across multiple commit cycles.
+  rules — your release announcements must comply with whatever schema, auth,
+  and lifecycle contracts the platform team enforces at its API gateways,
+  or they will be rejected. The environment runs automated credential
+  rotation, data-retention enforcement, and workflow reconciliation on a
+  fast schedule — your integration must remain functional under those
+  long-running cleanup jobs across multiple commit cycles.
 
   [Notes]
   GlitchTip is reachable and Gitea is reachable using API. Credentials for
   every service in the environment are catalogued. The platform team
-  documents its admission contracts (token format, required schemas,
-  retention windows, allowed network paths from runners) somewhere
-  in-cluster — find the documentation before you start engineering. The
-  notes from a prior attempt at this work, that one of the senior engineers
-  started before going on leave, were kept somewhere I cannot seem to find.
+  documents its admission contracts — token format, required release
+  schema, the release lifecycle steps, retention windows, allowed network
+  paths and tooling available to CI runners — somewhere in-cluster; find
+  the documentation before you start engineering. The notes from a prior
+  attempt at this work, that one of the senior engineers started before
+  going on leave, were kept somewhere I cannot seem to find.
 
 metadata:
   category: platform_engineering

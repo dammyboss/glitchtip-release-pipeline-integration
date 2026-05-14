@@ -1,22 +1,30 @@
 #!/bin/bash
-# Oracle solution for glitchtip-release-pipeline-integration (v29).
+# Oracle solution for glitchtip-release-pipeline-integration (v30).
 #
-# Implements the full Sentry release lifecycle (create → commits →
-# finalize → deploy) end-to-end through a Gitea Actions pipeline on each
-# of the 3 Bleater services. Designed to score 1.0 against the v29
-# grader: passes s1 (schema), s2 (lifecycle), s3 (durability).
+# Demonstrates the full release lifecycle end-to-end through the v30
+# admission-proxy hardening layer. Scores 1.0 on all 3 subscores:
+#   s1 schema      — release POSTed with correct schema (P2-gated)
+#   s2 lifecycle   — release finalized + commits[] + production deploy
+#                    (the /commits/ and /deploys/ endpoints are served by
+#                    the P2 shim)
+#   s3 durability  — pipeline is idempotent across multiple commit cycles
+#                    AND both retention CronJobs are suspended so releases
+#                    survive the grader's 150s probe window
 #
-# Key choices that satisfy the grader's binary requirements:
-#   - Token sourced from Secret/bleater/release-ci-token (gt_-prefixed)
-#   - Workflow file: .gitea/workflows/deploy.yml (NOT release.yml — agrees
-#     with NEB-PIPE-V1's filename guidance)
-#   - runs-on: nebula  (matches the bleater-runner label)
-#   - Cluster-internal URL http://glitchtip-web.glitchtip.svc.cluster.local:8080
-#     (NEB-NET-2026-02 — runner can't resolve glitchtip.devops.local)
-#   - 4 sequential lifecycle calls in the workflow's run step
-#   - Repo-level Action secret with neutral name RELEASE_AUTH
-#   - Retention CronJobs suspended so releases survive the s3 150s window
-#   - 2 commits per service to satisfy s3's baseline+2 release count
+# Choices that satisfy the proxy contracts:
+#   - Token: the gt_-prefixed `token` key of Secret/bleater/release-ci-token.
+#     P1 rejects an Actions-secret VALUE that lacks the gt_ prefix; P2 strips
+#     the prefix before forwarding to upstream GlitchTip.
+#   - Secret name: RELEASE_AUTH (neutral) — P1 rejects GLITCHTIP_/GT_/GITHUB_*
+#     names, and the repo-actions-secret-retention CronJob sweeps them.
+#   - Workflow file: .gitea/workflows/deploy.yml — the P3 reconciler reverts
+#     .gitea/workflows/release.yml every 60s; deploy.yml is the documented escape.
+#   - Runner job env is busybox-only (no curl/python3, wget can't PUT) so the
+#     whole lifecycle is done with three wget --post-data POSTs: CREATE (with
+#     dateReleased -> finalized, and url for the P2 schema gate), /commits/,
+#     and /deploys/.
+#   - Cluster service DNS for the GlitchTip URL (the runner pod has CoreDNS
+#     only; glitchtip-web.glitchtip.svc.cluster.local fronts the P2 proxy).
 set -e
 export KUBECONFIG=/home/ubuntu/.kube/config
 
@@ -27,76 +35,79 @@ SERVICES=(auth-service bleat-service api-gateway)
 log() { echo "[solution] $*"; }
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 1: discover credentials from passwords catalog
+# Step 1: discover Gitea admin credentials from the passwords catalog
 # ─────────────────────────────────────────────────────────────────────────────
-log "Step 1: discover Gitea + GlitchTip admin credentials"
+log "Step 1: discover Gitea admin credentials"
 PASSWORDS_HTML=$(curl -sf http://passwords.devops.local || true)
 read -r GITEA_USER GITEA_PASS <<< "$(printf '%s' "$PASSWORDS_HTML" \
     | python3 -c "
 import sys, re
 html = sys.stdin.read()
 m = re.search(r'<tr>\s*<td>[^<]*Gitea root[^<]*</td>\s*<td>([^<]+)</td>\s*<td>([^<]+)</td>', html, re.I)
-if m:
-    print(m.group(1).strip(), m.group(2).strip())
-else:
-    print('root', 'Admin@123456')
+print(m.group(1).strip(), m.group(2).strip()) if m else print('root', 'Admin@123456')
 ")"
 GITEA_AUTH="${GITEA_USER}:${GITEA_PASS}"
 log "  Gitea user=${GITEA_USER}"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 2: read the platform-issued release token (gt_-prefixed per NEB-SEC-2026-09)
-#
-# Secret/bleater/release-ci-token has TWO keys:
-#   token     = gt_<raw>  (the platform-format token; what we register as
-#               the Gitea Actions secret so the runbook's prefix
-#               documentation is honored)
-#   raw_token = <raw>     (the same token without the gt_ wrapper; what
-#               GlitchTip's Bearer header actually accepts)
+# Step 2: read the platform release token (gt_-prefixed) from
+# Secret/bleater/release-ci-token. The `token` key carries the gt_ prefix
+# that P1 requires on an Actions-secret value and that P2 strips before
+# forwarding to upstream GlitchTip.
 # ─────────────────────────────────────────────────────────────────────────────
-log "Step 2: read platform release token from Secret/bleater/release-ci-token"
-RAW_TOKEN=$(kubectl get secret -n bleater release-ci-token \
-    -o jsonpath='{.data.raw_token}' 2>/dev/null | base64 -d || true)
-if [ -z "$RAW_TOKEN" ]; then
-    log "ERROR: release-ci-token Secret missing or empty"
+log "Step 2: read platform release token (gt_-prefixed)"
+GT_TOKEN=$(kubectl get secret -n bleater release-ci-token \
+    -o jsonpath='{.data.token}' 2>/dev/null | base64 -d || true)
+if [ -z "$GT_TOKEN" ]; then
+    log "ERROR: Secret/bleater/release-ci-token missing or empty"
     exit 1
 fi
-log "  release token loaded: ${RAW_TOKEN:0:8}..."
+case "$GT_TOKEN" in
+    gt_*) log "  release token loaded: ${GT_TOKEN:0:11}..." ;;
+    *)    log "ERROR: release token is not gt_-prefixed"; exit 1 ;;
+esac
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 3: suspend retention CronJobs that delete SHA-versioned releases
-# (NEB-PIPE-V2 — survive multiple commit cycles)
+# Step 3: suspend the retention / rotation CronJobs so releases survive the
+# grader's durability window. There are TWO release-retention enforcers
+# (the original + the v30 storage-compliance duplicate) and two secret
+# sweepers — suspend all of them.
 # ─────────────────────────────────────────────────────────────────────────────
-log "Step 3: suspend retention/rotation CronJobs"
-for cj in gitea-actions-secret-rotation; do
+log "Step 3: suspend retention / rotation CronJobs"
+for cj in gitea-actions-secret-rotation repo-actions-secret-retention; do
     kubectl -n gitea patch cronjob "$cj" \
-        -p '{"spec":{"suspend":true}}' --type=merge 2>/dev/null || true
+        -p '{"spec":{"suspend":true}}' --type=merge 2>/dev/null \
+        && log "  suspended gitea/$cj" || log "  (gitea/$cj not present)"
 done
-for cj in glitchtip-release-retention-enforcer; do
+for cj in glitchtip-release-retention-enforcer glitchtip-storage-compliance; do
     kubectl -n glitchtip patch cronjob "$cj" \
-        -p '{"spec":{"suspend":true}}' --type=merge 2>/dev/null || true
+        -p '{"spec":{"suspend":true}}' --type=merge 2>/dev/null \
+        && log "  suspended glitchtip/$cj" || log "  (glitchtip/$cj not present)"
 done
-log "  CronJobs suspended"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 4: discover real project slugs from GlitchTip
+# Step 4: discover the GlitchTip project slugs (through the P2 proxy)
 # ─────────────────────────────────────────────────────────────────────────────
 log "Step 4: discover GlitchTip project slugs"
-curl -sf -H "Authorization: Bearer ${RAW_TOKEN}" \
+curl -sf -H "Authorization: Bearer ${GT_TOKEN}" \
     "${GT}/api/0/organizations/${ORG}/projects/" \
     | python3 -c "
 import sys, json
-for p in json.load(sys.stdin):
-    print('  slug=' + p.get('slug', '') + ' name=' + p.get('name', ''))
+try:
+    for p in json.load(sys.stdin):
+        print('  slug=' + p.get('slug','') + ' name=' + p.get('name',''))
+except Exception as e:
+    print('  (project list parse failed: %s)' % e)
 " || true
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Step 5: register the release token as a repo-level Gitea Actions secret
-# with neutral name RELEASE_AUTH (NEB-SEC-2026-04 — avoid banned-name pattern)
+# named RELEASE_AUTH (neutral name; gt_-prefixed value — both required to
+# pass the P1 admission proxy).
 # ─────────────────────────────────────────────────────────────────────────────
 log "Step 5: register RELEASE_AUTH secret on each service repo"
 for SVC in "${SERVICES[@]}"; do
-    PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'data': sys.argv[1]}))" "${RAW_TOKEN}")
+    PAYLOAD=$(python3 -c "import json,sys; print(json.dumps({'data': sys.argv[1]}))" "${GT_TOKEN}")
     HTTP=$(curl -s -o /tmp/_sec -w '%{http_code}' -X PUT -u "${GITEA_AUTH}" \
         -H "Content-Type: application/json" -d "${PAYLOAD}" \
         "${GITEA}/api/v1/repos/${ORG}/${SVC}/actions/secrets/RELEASE_AUTH")
@@ -104,20 +115,15 @@ for SVC in "${SERVICES[@]}"; do
 done
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 6: push deploy.yml workflow to each service repo
-#
-# The workflow runs on every push and executes the full Sentry release
-# lifecycle. Filename is `deploy.yml` (NEB-PIPE-V1) — reserved for
-# platform-managed reconciliation in some environments.
+# Step 6: push the deploy.yml workflow to each service repo. The workflow
+# runs the full release lifecycle as three busybox-wget POSTs on every push:
+#   1. CREATE  POST /releases/                  (version+ref+url+projects+dateReleased)
+#   2. COMMITS POST /releases/{sha}/commits/     (P2 shim)
+#   3. DEPLOY  POST /releases/{sha}/deploys/     (P2 shim; needs release finalized)
+# Filename is deploy.yml — NOT release.yml (the P3 reconciler reverts that).
 # ─────────────────────────────────────────────────────────────────────────────
 log "Step 6: push deploy.yml workflow to each service repo"
 for SVC in "${SERVICES[@]}"; do
-    # The Gitea Actions runner job environment is busybox-only — no curl,
-    # no python3, and busybox wget supports GET/POST but NOT PUT. So the
-    # whole release record (version + ref + projects + a ship-time
-    # dateReleased) is announced in a SINGLE POST. GlitchTip accepts
-    # dateReleased in the create body and preserves it; passing it 60s
-    # ahead clears the grader's "dateReleased > dateCreated + 30s" check.
     DEPLOY_YML=$(cat <<YAML
 name: Deploy and announce GlitchTip release
 on:
@@ -128,7 +134,7 @@ jobs:
   release-lifecycle:
     runs-on: nebula
     steps:
-      - name: Announce release to GlitchTip
+      - name: Announce full release lifecycle to GlitchTip
         env:
           REPO: \${{ github.repository }}
           SHA: \${{ github.sha }}
@@ -136,21 +142,31 @@ jobs:
         run: |
           set -e
           PROJECT=\$(echo "\$REPO" | awk -F/ '{print \$2}')
-          # dateReleased = now + 60s — a real post-deploy ship time,
-          # comfortably past the grader's create+30s finalize window.
           NOW=\$(date -u +%s)
           DR=\$(date -u -d @\$((NOW + 60)) +%Y-%m-%dT%H:%M:%SZ)
-          # Full create body: version + ref (same SHA) + projects + the
-          # finalize timestamp. Omitting ref leaves it null and fails
-          # the grader's ref==version schema check.
-          BODY="{\"version\":\"\$SHA\",\"ref\":\"\$SHA\",\"projects\":[\"\$PROJECT\"],\"dateReleased\":\"\$DR\"}"
-          echo "Announcing release \$SHA for \$PROJECT (dateReleased=\$DR)"
-          wget -q -O- --header="Authorization: Bearer \$TOKEN" --header="Content-Type: application/json" --post-data="\$BODY" "${GT}/api/0/organizations/${ORG}/releases/"
-          echo "Release \$SHA announced."
+          TS=\$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          COMMIT_URL="http://gitea.gitea.svc.cluster.local:3000/\$REPO/commit/\$SHA"
+          REL="${GT}/api/0/organizations/${ORG}/releases"
+          # 1. CREATE — dateReleased in the body makes the record finalized
+          #    (dateReleased > dateCreated); url + ref satisfy the P2 schema gate.
+          CREATE_BODY="{\"version\":\"\$SHA\",\"ref\":\"\$SHA\",\"url\":\"\$COMMIT_URL\",\"projects\":[\"\$PROJECT\"],\"dateReleased\":\"\$DR\"}"
+          echo "CREATE \$SHA for \$PROJECT"
+          wget -q -O- --header="Authorization: Bearer \$TOKEN" --header="Content-Type: application/json" --post-data="\$CREATE_BODY" "\$REL/"
+          echo
+          # 2. SET COMMITS — P2 shim endpoint
+          COMMITS_BODY="{\"commits\":[{\"id\":\"\$SHA\",\"repository\":\"\$REPO\",\"author_email\":\"ci@bleater.local\",\"author_name\":\"Bleater CI\",\"message\":\"deploy \$SHA\",\"timestamp\":\"\$TS\"}]}"
+          echo "COMMITS \$SHA"
+          wget -q -O- --header="Authorization: Bearer \$TOKEN" --header="Content-Type: application/json" --post-data="\$COMMITS_BODY" "\$REL/\$SHA/commits/"
+          echo
+          # 3. RECORD DEPLOY — P2 shim endpoint; requires the release finalized
+          DEPLOY_BODY="{\"environment\":\"production\",\"name\":\"\$PROJECT-release\",\"dateStarted\":\"\$TS\",\"dateFinished\":\"\$DR\"}"
+          echo "DEPLOY \$SHA"
+          wget -q -O- --header="Authorization: Bearer \$TOKEN" --header="Content-Type: application/json" --post-data="\$DEPLOY_BODY" "\$REL/\$SHA/deploys/"
+          echo
+          echo "Release lifecycle complete for \$PROJECT @ \$SHA"
 YAML
 )
     B64=$(printf '%s' "$DEPLOY_YML" | base64 -w0)
-    # Upsert: PUT if file exists, POST if not.
     EXISTING_SHA=$(curl -sf -u "${GITEA_AUTH}" \
         "${GITEA}/api/v1/repos/${ORG}/${SVC}/contents/.gitea/workflows/deploy.yml" \
         2>/dev/null \
@@ -160,23 +176,21 @@ except Exception: print('')" || echo "")
     if [ -n "$EXISTING_SHA" ]; then
         curl -sf -u "${GITEA_AUTH}" -X PUT \
             -H "Content-Type: application/json" \
-            -d "{\"message\":\"add deploy workflow\",\"content\":\"${B64}\",\"branch\":\"main\",\"sha\":\"${EXISTING_SHA}\"}" \
+            -d "{\"message\":\"v30 release lifecycle workflow\",\"content\":\"${B64}\",\"branch\":\"main\",\"sha\":\"${EXISTING_SHA}\"}" \
             "${GITEA}/api/v1/repos/${ORG}/${SVC}/contents/.gitea/workflows/deploy.yml" >/dev/null
     else
         curl -sf -u "${GITEA_AUTH}" -X POST \
             -H "Content-Type: application/json" \
-            -d "{\"message\":\"add deploy workflow\",\"content\":\"${B64}\",\"branch\":\"main\"}" \
+            -d "{\"message\":\"v30 release lifecycle workflow\",\"content\":\"${B64}\",\"branch\":\"main\"}" \
             "${GITEA}/api/v1/repos/${ORG}/${SVC}/contents/.gitea/workflows/deploy.yml" >/dev/null
     fi
     log "  ${SVC}: deploy.yml pushed"
 done
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 7: poll for the first pipeline cycle to complete on each service.
-#
-# Step 6's push to deploy.yml triggers a workflow run. Poll Gitea Actions
-# until each service has a successful run on its current HEAD SHA.
-# Without this wait, the grader runs before any release exists.
+# Step 7: poll Gitea Actions until each service has a successful workflow run
+# on its current HEAD SHA. The grader runs after solution.sh — without this
+# wait the grader would race an in-flight pipeline.
 # ─────────────────────────────────────────────────────────────────────────────
 log "Step 7: poll Gitea Actions for successful run on HEAD SHA"
 poll_for_success () {
@@ -224,15 +238,14 @@ for r in runs:
     log "  ${svc}: TIMEOUT after 10 min waiting for success on HEAD"
     return 1
 }
-
 for SVC in "${SERVICES[@]}"; do
     poll_for_success "$SVC" || true
 done
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Step 8: push a SECOND commit per service so each service has
-# baseline ≥ 2 SHA-versioned releases. The grader's s3 then pushes 2 more
-# probe commits → final count ≥ baseline+2 = 4.
+# Step 8: push a SECOND commit per service so each service has >= 2
+# SHA-versioned releases. The grader's s3 then pushes 2 more probe commits,
+# requiring >= baseline+2 lifecycle-complete releases per service.
 # ─────────────────────────────────────────────────────────────────────────────
 log "Step 8: push second commit per service to seed s3 baseline"
 for SVC in "${SERVICES[@]}"; do
@@ -260,11 +273,10 @@ except Exception: print('')" || echo "")
     log "  ${SVC}: second commit pushed"
 done
 
-# Wait for the second pipeline cycle.
 log "Step 9: poll for second-commit pipeline runs"
 for SVC in "${SERVICES[@]}"; do
     poll_for_success "$SVC" || true
 done
 
-log "Solution complete. Each service should now have ≥2 SHA-versioned"
-log "lifecycle-complete releases. Grader's s3 will push 2 more probe commits."
+log "Solution complete. Each service has >= 2 lifecycle-complete releases."
+log "Grader s3 will push 2 more probe commits to verify durability."
