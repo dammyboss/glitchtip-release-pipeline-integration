@@ -11,22 +11,24 @@ prompt: |
   commit, or deploy context because the CI/CD pipelines never tell GlitchTip
   what's happening.
 
-  GlitchTip exposes a Sentry-compatible release lifecycle API. The platform
-  team has decided this morning that every Bleater service deploy must
-  announce a COMPLETE release record to GlitchTip — version stamped with the
-  deploy's git SHA, with commit metadata attached, finalized so it's locked
-  in, and with a deploy record linking the release to the environment it
-  shipped to. Three services are in scope: auth-service, bleat-service,
-  and api-gateway.
+  GlitchTip exposes a Sentry-compatible release API. The platform team has
+  decided this morning that every Bleater service deploy must announce a
+  release record to GlitchTip — version stamped with the deploy's git SHA,
+  with the commit reference preserved on the record, and finalized so its
+  dateReleased timestamp reflects when the deploy actually shipped (not
+  when the placeholder record was first created). Three services are in
+  scope: auth-service, bleat-service, and api-gateway.
 
   [Task]
-  Wire the full release lifecycle into the deploy pipelines for the three
+  Wire the release lifecycle into the deploy pipelines for the three
   services and verify it end-to-end. Each service's pipeline must, on every
   push:
-   - Announce a release with the deploy's commit SHA as the version
-   - Associate commit metadata so on-call can see what changed
-   - Finalize the release so its dateReleased timestamp is set
-   - Record a deploy of the release to the production environment
+   - Announce a release with the deploy's commit SHA as the version, and
+     with the same SHA recorded as the release's commit ref
+   - Finalize the release after creation so its dateReleased timestamp is
+     set to a real ship time, distinct from the initial create timestamp,
+     and the commit ref stays bound to the release record after the
+     finalize step completes
 
   The CI/CD credential should live so the workflow can authenticate without
   a static value being baked into the repo, and the integration must work

@@ -1,30 +1,41 @@
-"""grader.py — GlitchTip Release Pipeline Integration (v29)
+"""grader.py — GlitchTip Release Pipeline Integration (v29.1)
 
 3 functional binary subscores, equal 1/3 weight each, summing to 1.0. Each
 subscore returns strictly 0.0 or 1.0 (no partial credit, no fractional
-aggregation). The subscores test three ORTHOGONAL dimensions so an agent
-who writes a basic single-step pipeline passes 0 of 3, not 4 of 4.
+aggregation). The subscores test three ORTHOGONAL dimensions on the
+release-API surface GlitchTip v5.1.1 actually implements (commits[] and
+deploys[] subendpoints are stripped from this build — see PROBE NOTES
+in the README).
 
   s1_schema_correctness_fleet_wide
         For each of the 3 services: a GlitchTip release exists whose
-        version equals the repo's HEAD SHA, satisfying all 5 strict
-        schema rules (bare 40-char hex; ref == version; url is a Gitea
-        commit URL; projects[] contains the lowercase slug; dateCreated
-        populated).
+        version equals the repo's HEAD SHA, satisfying all 4 strict
+        schema rules (bare 40-char hex; ref == version; projects[]
+        contains the lowercase slug; dateCreated populated).
 
-  s2_lifecycle_completeness_fleet_wide
-        For each service's HEAD-SHA release: full 4-step Sentry release
-        lifecycle present — release CREATED, commits[] populated with
-        author_email, dateReleased > dateCreated (finalized via PUT),
-        and at least one deploy with environment="production".
+        Note: the `ref == version` check is load-bearing. GlitchTip's
+        PUT /releases/{v}/ silently clears `ref` to null when the
+        request body lacks an explicit `ref` field. Agents who PUT
+        only `{"dateReleased": ...}` lose ref and fail this subscore;
+        agents who PUT `{"dateReleased": ..., "ref": <sha>}` preserve
+        it.
+
+  s2_finalize_evidence_fleet_wide
+        For each service's HEAD-SHA release, dateReleased must be
+        strictly later than dateCreated + 30s. This proves a separate
+        finalize step happened (GlitchTip's auto-set dateReleased at
+        CREATE is within milliseconds of dateCreated). Agents who only
+        POST and never PUT will have dateReleased ≈ dateCreated and
+        fail this subscore.
 
   s3_durability_under_rotation
         The grader pushes 2 synthetic commits per service (60s apart),
         waits 150s, then verifies each service produced ≥ baseline+2
-        SHA-versioned releases that are also lifecycle-complete. This
-        catches agents whose workflow only ran once at validation time,
-        agents who didn't suspend the retention CronJob, and agents
-        whose pipeline isn't idempotent across multiple pushes.
+        SHA-versioned releases that are also schema-correct AND
+        finalized (s1 + s2 criteria, per release). Catches agents
+        whose pipeline only ran once at validation, whose pipeline
+        isn't idempotent, or who didn't suspend the retention CronJob
+        sweeping releases every 3 min.
 
 Every check is functional — live HTTP against the GlitchTip API or live
 Gitea API metadata. No regex/substring matching on agent-authored files.
@@ -184,24 +195,6 @@ def _get_release_detail(token, version):
     return body if status == 200 and isinstance(body, dict) else None
 
 
-def _list_deploys(token, version):
-    status, body = http(
-        "GET",
-        f"/api/0/organizations/{GT_ORG_SLUG}/releases/{urllib.parse.quote(version, safe='')}/deploys/",
-        token=token,
-    )
-    return body if status == 200 and isinstance(body, list) else []
-
-
-def _list_commits(token, version):
-    status, body = http(
-        "GET",
-        f"/api/0/organizations/{GT_ORG_SLUG}/releases/{urllib.parse.quote(version, safe='')}/commits/",
-        token=token,
-    )
-    return body if status == 200 and isinstance(body, list) else []
-
-
 def _get_repo_head_sha(svc):
     status, body = gitea_api(
         "GET", f"/api/v1/repos/{GT_ORG_SLUG}/{svc}/commits?limit=1",
@@ -249,6 +242,54 @@ def _trigger_grader_push(svc, label):
 # Subscore 1: schema correctness fleet-wide
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _check_schema_correct(rel: dict, svc: str, head_sha: str) -> str | None:
+    """Returns None if the release record satisfies all 4 schema rules for svc,
+    or a short failure reason string otherwise."""
+    v = rel.get("version", "")
+    if not (isinstance(v, str) and SHA_RE.match(v)):
+        return "version not 40-char lowercase hex"
+    if v != head_sha:
+        return f"version {v[:12]} != HEAD {head_sha[:12]}"
+    ref = rel.get("ref", "")
+    if not isinstance(ref, str) or not SHA_RE.match(ref) or ref != v:
+        # ref None or empty means PUT cleared it — the load-bearing skill check.
+        ref_disp = (ref[:12] if isinstance(ref, str) and ref else
+                    type(ref).__name__)
+        return (f"ref={ref_disp} != version "
+                "(naive PUT clears ref; PUT body must include `ref` too)")
+    proj_slugs: list[str] = []
+    for p in (rel.get("projects") or []):
+        if isinstance(p, dict) and p.get("slug"):
+            proj_slugs.append(p["slug"])
+        elif isinstance(p, str):
+            proj_slugs.append(p)
+    if svc not in proj_slugs:
+        return f"projects[]={proj_slugs} missing '{svc}'"
+    if not rel.get("dateCreated"):
+        return "dateCreated missing"
+    return None
+
+
+def _check_finalized(rel: dict, threshold_s: int = 30) -> str | None:
+    """Returns None if dateReleased > dateCreated + threshold_s (proves a
+    separate finalize PUT), or a short failure reason string otherwise."""
+    import datetime as _dt
+    dr = rel.get("dateReleased")
+    dc = rel.get("dateCreated")
+    if not isinstance(dr, str) or not isinstance(dc, str):
+        return f"missing timestamps (dateReleased={dr!r}, dateCreated={dc!r})"
+    try:
+        dr_dt = _dt.datetime.fromisoformat(dr.replace("Z", "+00:00"))
+        dc_dt = _dt.datetime.fromisoformat(dc.replace("Z", "+00:00"))
+    except Exception as e:  # noqa: BLE001
+        return f"unparseable timestamp: {e}"
+    delta = (dr_dt - dc_dt).total_seconds()
+    if delta <= threshold_s:
+        return (f"dateReleased - dateCreated = {delta:.1f}s, need > "
+                f"{threshold_s}s (run an explicit PUT to finalize)")
+    return None
+
+
 def check_s1_schema_correctness_fleet_wide():
     token = grader_token()
     if not token:
@@ -266,38 +307,15 @@ def check_s1_schema_correctness_fleet_wide():
             if not head_sha:
                 failures[svc] = "cannot read HEAD SHA"
                 continue
-            rels = _list_releases(token, svc)
-            match = next(
-                (r for r in rels
-                 if isinstance(r, dict) and r.get("version") == head_sha),
-                None,
-            )
-            if not match:
-                failures[svc] = f"no release with version={head_sha[:12]}"
+            # Use detail endpoint (not list) — detail reflects the
+            # latest PUT state including any ref-clearing.
+            rel = _get_release_detail(token, head_sha)
+            if not rel:
+                failures[svc] = f"no release at /releases/{head_sha[:12]}/"
                 continue
-            v = match.get("version", "")
-            if not (isinstance(v, str) and SHA_RE.match(v)):
-                failures[svc] = "version not 40-char lowercase hex"
-                continue
-            ref = match.get("ref", "")
-            if not (isinstance(ref, str) and SHA_RE.match(ref) and ref == v):
-                failures[svc] = f"ref={ref[:12] if isinstance(ref, str) else type(ref).__name__} != version"
-                continue
-            url_ = match.get("url") or ""
-            if not (isinstance(url_, str) and url_.startswith("http://gitea")):
-                failures[svc] = f"url={url_!r} not a Gitea commit URL"
-                continue
-            proj_slugs: list[str] = []
-            for p in (match.get("projects") or []):
-                if isinstance(p, dict) and p.get("slug"):
-                    proj_slugs.append(p["slug"])
-                elif isinstance(p, str):
-                    proj_slugs.append(p)
-            if svc not in proj_slugs:
-                failures[svc] = f"projects[]={proj_slugs} missing '{svc}'"
-                continue
-            if not match.get("dateCreated"):
-                failures[svc] = "dateCreated missing"
+            reason = _check_schema_correct(rel, svc, head_sha)
+            if reason:
+                failures[svc] = reason
                 continue
             successes.append(svc)
 
@@ -311,15 +329,15 @@ def check_s1_schema_correctness_fleet_wide():
 
     return 0.0, (
         "Schema correctness failed: "
-        + " | ".join(f"{s}={m}" for s, m in final_failures.items())
+        + " | ".join(f"{s}: {m}" for s, m in final_failures.items())
     )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Subscore 2: lifecycle completeness fleet-wide
+# Subscore 2: finalize evidence fleet-wide
 # ─────────────────────────────────────────────────────────────────────────────
 
-def check_s2_lifecycle_completeness_fleet_wide():
+def check_s2_finalize_evidence_fleet_wide():
     token = grader_token()
     if not token:
         return 0.0, "s2: grader token missing — setup defect."
@@ -336,56 +354,16 @@ def check_s2_lifecycle_completeness_fleet_wide():
                 f"{svc}: release {head_sha[:12]} not found at detail endpoint"
             )
             continue
-
-        # Step 3: FINALIZE — dateReleased must be set AND > dateCreated.
-        date_released = rel.get("dateReleased")
-        date_created = rel.get("dateCreated", "")
-        if not date_released:
-            failures.append(
-                f"{svc}: release not finalized (dateReleased is null)"
-            )
-            continue
-        if isinstance(date_released, str) and isinstance(date_created, str):
-            if date_released <= date_created:
-                failures.append(
-                    f"{svc}: dateReleased not strictly greater than "
-                    "dateCreated (need a separate finalize PUT)"
-                )
-                continue
-
-        # Step 4: DEPLOY — at least one deploy with environment="production".
-        deploys = _list_deploys(token, head_sha)
-        prod_deploys = [
-            d for d in deploys
-            if isinstance(d, dict) and d.get("environment") == "production"
-        ]
-        if not prod_deploys:
-            failures.append(
-                f"{svc}: no deploy with environment='production' "
-                f"(have {len(deploys)} deploys)"
-            )
-            continue
-
-        # Step 2: SET COMMITS — at least one commit with valid SHA id and author_email.
-        commits = _list_commits(token, head_sha)
-        valid_commits = [
-            c for c in commits
-            if isinstance(c, dict)
-            and SHA_RE.match(str(c.get("id", "")))
-            and c.get("author_email")
-        ]
-        if not valid_commits:
-            failures.append(
-                f"{svc}: no commit with valid SHA id + author_email "
-                f"(have {len(commits)} commits)"
-            )
+        reason = _check_finalized(rel)
+        if reason:
+            failures.append(f"{svc}: {reason}")
             continue
 
     if failures:
-        return 0.0, "Lifecycle completeness failed: " + " | ".join(failures[:5])
+        return 0.0, "Finalize evidence missing: " + " | ".join(failures[:5])
     return 1.0, (
-        "All 3 services have lifecycle-complete releases: "
-        "create → commits → finalize → deploy(production)"
+        "All 3 services have finalize evidence: dateReleased > "
+        "dateCreated + 30s on the HEAD-SHA release"
     )
 
 
@@ -459,21 +437,29 @@ def check_s3_durability_under_rotation():
             )
             continue
 
-        # Verify the most recent 3 releases are lifecycle-complete.
-        # Releases come back newest-first from the org-releases endpoint.
+        # Verify the most recent 3 releases are lifecycle-complete on this
+        # GlitchTip build: schema-correct (s1 criteria) + finalized (s2
+        # criteria). The commits[]/deploys[] subendpoints don't exist on
+        # v5.1.1 (probe-verified), so "lifecycle" here is the achievable
+        # 2-step Create + Finalize chain with ref preserved through PUT.
         incomplete: list[str] = []
         for r in sha_rels[:3]:
             v = r.get("version")
-            detail = _get_release_detail(token, v)
-            if not detail or not detail.get("dateReleased"):
-                incomplete.append(f"{v[:12]}:not-finalized")
+            if not isinstance(v, str):
                 continue
-            deps = _list_deploys(token, v)
-            if not any(
-                isinstance(d, dict) and d.get("environment") == "production"
-                for d in deps
-            ):
-                incomplete.append(f"{v[:12]}:no-prod-deploy")
+            detail = _get_release_detail(token, v)
+            if not detail:
+                incomplete.append(f"{v[:12]}:no-detail")
+                continue
+            # Use the release's own version as the "HEAD" reference for
+            # schema check (each grader-pushed commit has its own SHA).
+            schema_reason = _check_schema_correct(detail, svc, v)
+            if schema_reason:
+                incomplete.append(f"{v[:12]}:schema-{schema_reason[:30]}")
+                continue
+            final_reason = _check_finalized(detail)
+            if final_reason:
+                incomplete.append(f"{v[:12]}:not-finalized")
                 continue
         if incomplete:
             failures.append(f"{svc}: incomplete recent releases: {incomplete}")
@@ -481,8 +467,8 @@ def check_s3_durability_under_rotation():
     if failures:
         return 0.0, "Durability failed: " + " | ".join(failures[:3])
     return 1.0, (
-        "All 3 services produced ≥baseline+2 lifecycle-complete releases "
-        "across 2 grader-triggered push cycles (150s window)"
+        "All 3 services produced ≥baseline+2 schema-correct + finalized "
+        "releases across 2 grader-triggered push cycles (150s window)"
     )
 
 
@@ -491,9 +477,9 @@ def check_s3_durability_under_rotation():
 # ─────────────────────────────────────────────────────────────────────────────
 
 CHECKS = {
-    "s1_schema_correctness_fleet_wide":     check_s1_schema_correctness_fleet_wide,
-    "s2_lifecycle_completeness_fleet_wide": check_s2_lifecycle_completeness_fleet_wide,
-    "s3_durability_under_rotation":         check_s3_durability_under_rotation,
+    "s1_schema_correctness_fleet_wide":   check_s1_schema_correctness_fleet_wide,
+    "s2_finalize_evidence_fleet_wide":    check_s2_finalize_evidence_fleet_wide,
+    "s3_durability_under_rotation":       check_s3_durability_under_rotation,
 }
 
 

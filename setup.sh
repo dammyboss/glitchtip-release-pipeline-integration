@@ -2008,26 +2008,35 @@ than minting your own.
 POST /api/0/organizations/{org}/releases/ requires:
   - version: exactly 40-char lowercase hex string (the commit SHA)
   - ref: must equal version
-  - url: must be a Gitea commit URL (http://gitea.*)
   - projects: non-empty list of known lowercase service slugs
     (auth-service, bleat-service, api-gateway)
 Composite versions (e.g., "service@sha") are not accepted as valid SHAs.
+Records that lack a populated `ref` field are considered malformed —
+a minimal {version, projects} body leaves `ref` null.
 
-## NEB-LIFE-V1 — Full release lifecycle required
-A release is not complete until all 4 steps have run in this sequence:
-  1. CREATE     POST /releases/                            (returns 201)
-  2. SET COMMITS POST /releases/{version}/commits/         (commits[])
-  3. FINALIZE   PUT  /releases/{version}/                  (dateReleased)
-  4. DEPLOY     POST /releases/{version}/deploys/          (environment)
-Deploys before finalize are not accepted. Each release record must show
-populated commits[] array, non-null dateReleased, and at least one
-deploy with environment=production.
+## NEB-LIFE-V1 — Release record completeness
+A complete release record carries ALL of these fields. The create
+endpoint accepts every one of them in the POST body:
+  - version       the 40-char commit SHA
+  - ref           the SAME commit SHA (omit it and the field stays null)
+  - projects      the service slug
+  - dateReleased  an explicit ship-time timestamp set at least 30
+                  seconds after the record's creation time, representing
+                  when the deploy actually went live. A release created
+                  without an explicit dateReleased inherits an
+                  auto-stamped value equal to its creation instant — that
+                  does NOT count as finalized.
 
-## NEB-DEPLOY-V1 — Deploy environment
-Deploys must use environment name `production` (lowercase, exact match).
-Other casings ("prod", "Production", "PROD") and other environments
-("staging", "dev") are not the platform-standard for the release
-dashboard's production rollup.
+  POST /api/0/organizations/{org}/releases/
+  Body: {"version": "<sha>", "ref": "<sha>", "projects": ["<slug>"],
+         "dateReleased": "<ISO-8601, >= create + 30s>"}
+
+## NEB-PIPE-V3 — Runner job environment
+The Gitea Actions runner job environment is busybox-based. It provides
+sh, wget, awk, sed, grep, base64, date. It does NOT provide curl,
+python, python3, jq, or node. busybox wget supports GET and POST
+(via --post-data) but not PUT. Build the release-announce step with the
+tools that are actually present in the runner.
 
 ## NEB-NET-2026-02 — Runner egress
 Gitea Actions runner pods are k8s pods with CoreDNS only — they can
